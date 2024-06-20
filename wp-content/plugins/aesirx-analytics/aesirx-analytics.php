@@ -1,36 +1,112 @@
 <?php
 /**
- * Plugin Name: aesirx-analytics
- * Description: Aesirx analytics plugin.
- * Version: 1.0.1-alpha.1
+ * Plugin Name: AesirX Analytics
+ * Plugin URI: https://analytics.aesirx.io?utm_source=wpplugin&utm_medium=web&utm_campaign=wordpress&utm_id=aesirx&utm_term=wordpress&utm_content=analytics
+ * Description: Aesirx analytics plugin. When you join forces with AesirX, you're not just becoming a Partner - you're also becoming a freedom fighter in the battle for privacy! Earn 25% Affiliate Commission <a href="https://aesirx.io/seed-round?utm_source=wpplugin&utm_medium=web&utm_campaign=wordpress&utm_id=aesirx&utm_term=wordpress&utm_content=analytics">[Click to Join]</a>
+ * Version: 3.1.3
  * Author: aesirx.io
  * Author URI: https://aesirx.io/
  * Domain Path: /languages
  * Text Domain: aesirx-analytics
- * Requires PHP: 7.2
+ * Requires PHP: 8.1
+ * License: GPL v3
+ * License URI: https://www.gnu.org/licenses/gpl-3.0.html
+ * Requires Plugins: wp-crontrol
+ * 
  **/
 
-use AesirxAnalytics\Route\Middleware\IsBackendMiddlware;
-use Pecee\SimpleRouter\Exceptions\NotFoundHttpException;
-use Symfony\Component\Process\Process;
-use Pecee\SimpleRouter\SimpleRouter;
+if ( ! defined( 'ABSPATH' ) ) exit; // Exit if accessed directly
 
-require_once WP_PLUGIN_DIR . '/aesirx-analytics/vendor/autoload.php';
+use AesirxAnalytics\CliFactory;
+use AesirxAnalytics\Track\ApiTracker;
+use AesirxAnalytics\Track\CliTracker;
+use AesirxAnalyticsLib\Exception\ExceptionWithResponseCode;
+use AesirxAnalytics\Route\Middleware\IsBackendMiddleware;
+use AesirxAnalyticsLib\Exception\ExceptionWithErrorType;
+use AesirxAnalyticsLib\RouterFactory;
+use Pecee\Http\Request;
+use Pecee\SimpleRouter\Exceptions\NotFoundHttpException;
+use Pecee\SimpleRouter\Route\RouteUrl;
+
+require_once plugin_dir_path(__FILE__) . 'vendor/autoload.php';
 require_once 'includes/settings.php';
 
-add_action('wp_enqueue_scripts', function (): void {
-  wp_register_script('aesirx-analytics', plugins_url('assets/js/analytics.js', __FILE__));
-  wp_enqueue_script('aesirx-analytics');
+function aesirx_analytics_config_is_ok(string $isStorage = null): bool {
+    $options = get_option('aesirx_analytics_plugin_options');
+    $res = (!empty($options['storage'])
+        && (
+            ($options['storage'] == 'internal' && !empty($options['license']) && CliFactory::getCli()->analyticsCliExists())
+            || ($options['storage'] == 'external' && !empty($options['domain']))
+        ));
 
-  $options = get_option('aesirx_analytics_plugin_options');
+    if ($res
+        && !is_null($isStorage))
+    {
+        $res = $options['storage'] == $isStorage;
+    }
 
-  $domain =
-    ($options['storage'] ?? 'internal') == 'internal'
-      ? get_bloginfo('url')
-      : $options['domain'] ?? '';
+    return $res;
+}
 
-  wp_add_inline_script('aesirx-analytics', 'window.aesirx1stparty="' . $domain . '";', 'before');
-});
+if (aesirx_analytics_config_is_ok()) {
+    add_action('wp_enqueue_scripts', function (): void {
+        wp_register_script('aesirx-analytics', plugins_url('assets/js/analytics.js', __FILE__), [], true, true);
+        wp_enqueue_script('aesirx-analytics');
+
+        $options = get_option('aesirx_analytics_plugin_options');
+
+        $domain =
+            ($options['storage'] ?? 'internal') == 'internal'
+                ? get_bloginfo('url')
+                : rtrim($options['domain'] ?? '', '/');
+
+        $consent =
+            ($options['consent'] ?? 'false') == 'true'
+                ? 'false'
+                : 'true';
+
+        $trackEcommerce = ($options['track_ecommerce'] ?? 'true') == 'true' ? 'true': 'false';
+
+        $clientId = $options['clientid'] ?? '';
+        $secret = $options['secret'] ?? '';
+
+        wp_add_inline_script('aesirx-analytics', 'window.aesirx1stparty="' . $domain . '";window.disableAnalyticsConsent="' . $consent . '";window.aesirxClientID="' . $clientId . '";window.aesirxClientSecret="' . $secret . '";window.aesirxTrackEcommerce="' . $trackEcommerce . '";', 'before');
+    });
+
+    // Track e-commerce
+    add_action( 'init', function (): void {
+        $options = get_option('aesirx_analytics_plugin_options');
+
+        if (is_admin()
+            || ($options['track_ecommerce'] ?? 'true') != 'true')
+        {
+            return;
+        }
+
+        if (!session_id()) {
+            session_start();
+        }
+
+        $flowUuid = sanitize_text_field($_SESSION['analytics_flow_uuid']) ?? null;
+
+        if (is_null($flowUuid))
+        {
+            return;
+        }
+
+        if (aesirx_analytics_config_is_ok('internal'))
+        {
+            $tracker = new CliTracker(CliFactory::getCli());
+        }
+        else
+        {
+            $tracker = new ApiTracker(rtrim($options['domain'] ?? '', '/'));
+        }
+
+        (new \AesirxAnalytics\Integration\Woocommerce($tracker, $flowUuid))
+            ->registerHooks();
+    } );
+}
 
 add_action('plugins_loaded', function () {
   load_plugin_textdomain(
@@ -40,140 +116,27 @@ add_action('plugins_loaded', function () {
   );
 });
 
-register_activation_hook(__FILE__, function () {
-  process_analytics(['migrate']);
-});
-
 add_action('analytics_cron_geo', function () {
-  process_analytics(['job', 'geo']);
+    if (aesirx_analytics_config_is_ok('internal')) {
+        CliFactory::getCli()->processAnalytics(['job', 'geo']);
+    }
 });
 
 if (!wp_next_scheduled('analytics_cron_geo')) {
   wp_schedule_event(time(), 'hourly', 'analytics_cron_geo');
 }
 
-function process_analytics(array $command, bool $makeExecutable = true): Process
-{
-  $file = WP_PLUGIN_DIR . '/aesirx-analytics/assets/analytics-cli';
-  $options = get_option('aesirx_analytics_plugin_options');
-
-  $env = [
-    'DBUSER' => DB_USER,
-    'DBPASS' => DB_PASSWORD,
-    'DBNAME' => DB_NAME,
-    'DBTYPE' => 'mysql',
-    'LICENSE' => $options['license'] ?? '',
-  ];
-
-  $dbHost = explode(':', DB_HOST);
-
-  $env['DBHOST'] = $dbHost[0];
-
-  if (count($dbHost) > 1) {
-    $env['DBPORT'] = $dbHost[1];
-  }
-
-	// Plugin probably updated, we need to make sure it's executable and database is up-to-date
-	if ($makeExecutable && 0755 !== (fileperms($file) & 0777))
-	{
-		chmod($file,0755);
-
-    if ($command != ['migrate']) {
-      process_analytics(['migrate'], false);
-    }
-  }
-
-  $process = new Process(array_merge([$file], $command), null, $env);
-  $process->run();
-
-  return $process;
-}
-
 add_filter('plugin_action_links_' . plugin_basename(__FILE__), function ($links) {
   $url = esc_url(add_query_arg('page', 'aesirx-analytics-plugin', get_admin_url() . 'admin.php'));
-  array_push($links, "<a href='$url'>" . __('Settings') . '</a>');
+  array_push($links, "<a href='$url'>" . esc_html__('Settings', 'aesirx-analytics') . '</a>');
   return $links;
 });
 
-function apply_if_not_empty(array $request = null, array $fields): array
-{
-  $command = [];
-
-  if (!empty($request)) {
-    foreach ($fields as $from => $to) {
-      if (array_key_exists($from, $request)) {
-        foreach ((array) $request[$from] as $one) {
-          $command[] = '--' . $to;
-          $command[] = $one;
-        }
-      }
-    }
-  }
-
-  return $command;
+if (CliFactory::getCli()->analyticsCliExists()) {
+    add_action( 'parse_request', 'aesirx_analytics_url_handler' );
 }
 
-function apply_list_params(): array
-{
-  $command = [];
-  $params = SimpleRouter::request()
-    ->getUrl()
-    ->getParams();
-
-  foreach ($params as $key => $values) {
-    $converterKey = str_replace('_', '-', $key);
-
-    switch ($key) {
-      case 'page':
-      case 'page_size':
-        $command[] = '--' . $converterKey;
-        $command[] = $values;
-        break;
-      case 'sort':
-      case 'with':
-      case 'sort_direction':
-        foreach ($values as $value) {
-          $command[] = '--' . $converterKey;
-          $command[] = $value;
-        }
-        break;
-      case 'filter':
-        foreach ($values as $keyValue => $value) {
-          if (is_iterable($value)) {
-            foreach ($value as $v) {
-              $command[] = '--filter';
-              $command[] = $keyValue . '[]=' . $v;
-            }
-          } else {
-            $command[] = '--filter';
-            $command[] = $keyValue . '=' . $value;
-          }
-        }
-
-        break;
-    }
-  }
-
-  return $command;
-}
-
-function apply_attributes(array $request): array
-{
-  $command = [];
-
-  if (!empty($request['attributes'] ?? [])) {
-    foreach ($request['attributes'] as $name => $value) {
-      $command[] = '--attributes';
-      $command[] = $name . '=' . $value;
-    }
-  }
-
-  return $command;
-}
-
-add_action('parse_request', 'my_custom_url_handler');
-
-function my_custom_url_handler()
+function aesirx_analytics_url_handler()
 {
   $options = get_option('aesirx_analytics_plugin_options');
 
@@ -184,157 +147,181 @@ function my_custom_url_handler()
   //	define( 'WP_DEBUG', true );
   //	define( 'WP_DEBUG_DISPLAY', true );
   //	@ini_set( 'display_errors', 1 );
+    $callCommand = function (array $command): string {
+        try
+        {
+            $process = CliFactory::getCli()->processAnalytics($command);
+        }
+        catch (Throwable $e)
+        {
+            $code = 500;
 
-  $request = SimpleRouter::request();
-  $requestBody = json_decode(file_get_contents('php://input'), true);
-  $requestUrlParams = $request->getUrl()->getParams();
-  $command = null;
+            if ($e instanceof ExceptionWithErrorType)
+            {
+                switch ($e->getErrorType())
+                {
+                    case "NotFoundError":
+                        $code = 404;
+                        break;
+                    case "ValidationError":
+                        $code = 400;
+                        break;
+                    case "Rejected":
+                        $code = 406;
+                        break;
+                }
+            }
 
-  SimpleRouter::group(['prefix' => '/visitor/v1'], function () use (
-    &$command,
-    $requestBody,
-    $request
-  ) {
-    SimpleRouter::post('/init', function () use (&$command, $requestBody, $request) {
-      $command = [
-        'visitor',
-        'init',
-        'v1',
-        '--ip',
-        empty($requestBody['ip']) ? $request->getIp() : $requestBody['ip'],
-      ];
-      $fields = [
-        'user_agent' => 'user-agent',
-        'device' => 'device',
-        'browser_name' => 'browser-name',
-        'browser_version' => 'browser-version',
-        'lang' => 'lang',
-        'url' => 'url',
-        'referer' => 'referer',
-        'event_name' => 'event-name',
-        'event_type' => 'event-type',
-      ];
-      $command = array_merge($command, apply_if_not_empty($requestBody, $fields));
-      $command = array_merge($command, apply_attributes($requestBody));
-    });
+            throw new ExceptionWithResponseCode($e->getMessage(), $code, $e->getCode(), $e);
+        }
 
-    SimpleRouter::post('/start', function () use (&$command, $requestBody) {
-      $command = ['visitor', 'start', 'v1'];
-
-      $fields = [
-        'visitor_uuid' => 'visitor-uuid',
-        'url' => 'url',
-        'referer' => 'referer',
-        'event_name' => 'event-name',
-        'event_type' => 'event-type',
-        'event_uuid' => 'event-uuid',
-      ];
-      $command = array_merge($command, apply_if_not_empty($requestBody, $fields));
-      $command = array_merge($command, apply_attributes($requestBody));
-    });
-
-    SimpleRouter::post('/end', function () use (&$command, $requestBody) {
-      $command = ['visitor', 'end', 'v1'];
-      $fields = [
-        'visitor_uuid' => 'visitor-uuid',
-        'event_uuid' => 'event-uuid',
-      ];
-      $command = array_merge($command, apply_if_not_empty($requestBody, $fields));
-    });
-  });
-
-  SimpleRouter::group(['middleware' => IsBackendMiddlware::class], function () use (
-    &$command,
-    $requestUrlParams
-  ) {
-    SimpleRouter::get('/flow/v1/{flow_uuid}', function (string $flowUuid) use (
-      &$command,
-      $requestUrlParams
-    ) {
-      $command = ['get', 'flow', 'v1', $flowUuid];
-      $command = array_merge($command, apply_if_not_empty($requestUrlParams, ['with' => 'with']));
-    });
-    SimpleRouter::get('/flow/v1/{start_date}/{end_date}', function (
-      string $start,
-      string $end
-    ) use (&$command, $requestUrlParams) {
-      $command = array_merge(
-        ['get', 'flows', 'v1', '--start', $start, '--end', $end],
-        apply_list_params()
-      );
-    });
-
-    SimpleRouter::get('/visitor/v1/{start_date}/{end_date}', function (
-      string $start,
-      string $end
-    ) use (&$command, $requestUrlParams) {
-      $command = array_merge(
-        ['get', 'events', 'v1', '--start', $start, '--end', $end],
-        apply_list_params()
-      );
-    });
-
-    foreach (
-      [
-        'visits',
-        'domains',
-        'metrics',
-        'pages',
-        'visitors',
-        'browsers',
-        'browserversions',
-        'languages',
-        'devices',
-        'countries',
-        'cities',
-        'isps',
-        'attribute',
-      ]
-      as $statistic
-    ) {
-      SimpleRouter::get('/' . $statistic . '/v1/{start_date}/{end_date}', function (
-        string $start,
-        string $end
-      ) use (&$command, $statistic) {
-        $path = $statistic == 'attribute' ? 'attributes' : $statistic;
-        $command = array_merge(
-          ['statistics', $path, 'v1', '--start', $start, '--end', $end],
-          apply_list_params()
-        );
-      });
-    }
-  });
+        if (!headers_sent()) {
+            header( 'Content-Type: application/json; charset=utf-8' );
+        }
+        return $process->getOutput();
+    };
 
   try {
-    SimpleRouter::start();
+      $router = (new RouterFactory(
+          $callCommand,
+          new IsBackendMiddleware(),
+          null,
+          site_url( '', 'relative' ))
+      )
+          ->getSimpleRouter();
+
+      $router->addRoute(
+          (new RouteUrl('/remember_flow/{flow}', static function (string $flow): string {
+              if (!session_id()) {
+                  session_start();
+              }
+
+              $_SESSION['analytics_flow_uuid'] = $flow;
+
+              return json_encode(true);
+          }))
+              ->setWhere(['flow' => '[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}'])
+              ->setRequestMethods([Request::REQUEST_TYPE_POST])
+      );
+
+      echo wp_kses_post($router->start());
   } catch (Throwable $e) {
     if ($e instanceof NotFoundHttpException) {
       return;
     }
 
-    echo json_encode(['error' => $e->getMessage()]);
-    die();
-  }
-
-  if (is_null($command)) {
-    return;
-  }
-
-  $process = process_analytics($command);
-
-  if ($process->isSuccessful()) {
-    echo $process->getOutput();
-  } else {
-    $err = $process->getErrorOutput();
-
-    json_decode($err);
-
-    if (json_last_error() === JSON_ERROR_NONE) {
-      echo $err;
+    if ($e instanceof ExceptionWithResponseCode) {
+        $code = $e->getResponseCode();
     } else {
-      echo json_encode($err);
+        $code = 500;
     }
+
+      if (!headers_sent()) {
+          header( 'Content-Type: application/json; charset=utf-8' );
+      }
+    http_response_code($code);
+    echo wp_json_encode([
+        'error' => $e->getMessage(),
+    ]);
   }
 
   die();
 }
+
+register_activation_hook(__FILE__, 'aesirx_analytics_initialize_function');
+function aesirx_analytics_initialize_function() {
+    add_option('aesirx_analytics_do_activation_redirect', true);
+}
+
+function aesirx_analytics_update_plugins(WP_Upgrader $upgrader_object, array $options ): void {
+    $current_plugin_path_name = plugin_basename( __FILE__ );
+    $download = false;
+
+    if (in_array($options['action'], ['update', 'install'])
+        && $options['type'] == 'plugin' ) {
+        if ($options['bulk'] ?? false) {
+            foreach($options['plugins'] as $each_plugin) {
+                if ($each_plugin == $current_plugin_path_name) {
+                    $download = true;
+                    break;
+                }
+            }
+        } elseif (property_exists($upgrader_object, 'new_plugin_data')
+                && !empty($upgrader_object->new_plugin_data['Name'])
+                && $upgrader_object->new_plugin_data['Name'] == 'aesirx-analytics'
+                && property_exists($upgrader_object->skin, 'overwrite')
+                && $upgrader_object->skin->overwrite == 'update-plugin') {
+            $download = true;
+        }
+    }
+
+    $options = get_option('aesirx_analytics_plugin_options');
+
+    if ($download
+        && ($options['storage'] ?? null) == 'internal') {
+        try {
+            CliFactory::getCli()->downloadAnalyticsCli();
+        } catch (Throwable $e) {
+            set_transient( 'aesirx_analytics_update_notice', serialize($e) );
+        }
+    }
+}
+
+function aesirx_analytics_display_update_notice(  ) {
+    $notice = get_transient( 'aesirx_analytics_update_notice' );
+    if( $notice ) {
+
+        $notice = unserialize($notice);
+
+        if ($notice instanceof Throwable)
+        {
+            /* translators: %s: error message */
+            echo aesirx_analytics_escape_html('<div class="notice notice-error"><p>' . sprintf(esc_html__('Problem with Aesirx Analytics plugin install: %s', 'aesirx-analytics'), $notice->getMessage()) . '</p></div>');
+        }
+
+        delete_transient( 'aesirx_analytics_update_notice' );
+    }
+}
+
+add_action( 'admin_notices', 'aesirx_analytics_display_update_notice' );
+add_action( 'upgrader_process_complete', 'aesirx_analytics_update_plugins', 10, 2);
+
+add_action('admin_init', function () {
+    if (get_option('aesirx_analytics_do_activation_redirect', false)) {
+
+        delete_option('aesirx_analytics_do_activation_redirect');
+
+        if (wp_safe_redirect("options-general.php?page=aesirx-analytics-plugin")) {
+            exit();
+        }
+    }
+
+    add_action('load-options.php', function () {
+        if (!array_key_exists('submit', $_REQUEST)
+            || $_REQUEST['submit'] !== 'download_analytics_cli'
+            || !array_key_exists('option_page', $_REQUEST)
+            || $_REQUEST['option_page'] !== 'aesirx_analytics_plugin_options') {
+            return;
+        }
+
+        try {
+            CliFactory::getCli()->downloadAnalyticsCli();
+
+            add_settings_error(
+                'aesirx_analytics_plugin_options',
+                'download',
+                esc_html__('Library successfully downloaded.', 'aesirx-analytics'),
+                'info'
+            );
+        }
+        catch (Throwable $e)
+        {
+            add_settings_error(
+                'aesirx_analytics_plugin_options',
+                'download',
+                /* translators: %s: error message */
+                sprintf(esc_html__('Error: %s', 'aesirx-analytics'), $e->getMessage())
+            );
+        }
+    });
+});

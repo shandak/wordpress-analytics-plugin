@@ -1,24 +1,23 @@
 const path = require('path');
-const HtmlWebpackPlugin = require('html-webpack-plugin');
-const { ProvidePlugin } = require('webpack');
+const { ProvidePlugin, DefinePlugin } = require('webpack');
 const FileManagerPlugin = require('filemanager-webpack-plugin');
 const TerserPlugin = require('terser-webpack-plugin');
+const WebpackAssetsManifest = require('webpack-assets-manifest');
+const dist = process.env.DIST;
+const { GitRevisionPlugin } = require('git-revision-webpack-plugin');
+const gitRevisionPlugin = new GitRevisionPlugin();
 
 module.exports = {
-  mode: 'development',
+  mode: 'production',
+  entry: {
+    plugin: './assets/plugin/index.tsx',
+    bi: './assets/bi/index.tsx',
+  },
   module: {
     rules: [
       {
         test: /\.tsx?$/,
-        use: [
-          {
-            loader: 'babel-loader',
-            options: {
-              presets: ['@babel/preset-react', '@babel/preset-env'],
-            },
-          },
-          'ts-loader',
-        ],
+        use: 'ts-loader',
       },
       {
         test: /\.(sa|sc|c)ss$/,
@@ -45,11 +44,8 @@ module.exports = {
     new ProvidePlugin({
       process: 'process/browser',
     }),
-    new HtmlWebpackPlugin({
-      inject: false,
-      filename: 'includes/settings.php',
-      template: './wp-content/plugins/aesirx-analytics/includes/settings.php',
-      minify: false,
+    new DefinePlugin({
+      VERSION: JSON.stringify(gitRevisionPlugin.version()),
     }),
 
     new FileManagerPlugin({
@@ -58,21 +54,27 @@ module.exports = {
           copy: [
             {
               source: path.resolve(__dirname, './node_modules/aesirx-bi-app/public/assets/images/'),
-              destination: path.resolve(__dirname, './dist/plugin/aesirx-analytics/assets/images/'),
+              destination: path.resolve(
+                __dirname,
+                `${dist}/plugins/aesirx-analytics/assets/images/`
+              ),
             },
             {
               source: path.resolve(__dirname, './node_modules/aesirx-bi-app/public/assets/data/'),
-              destination: path.resolve(__dirname, './dist/plugin/aesirx-analytics/assets/data/'),
+              destination: path.resolve(__dirname, `${dist}/plugins/aesirx-analytics/assets/data/`),
             },
           ],
         },
       },
     }),
+
+    new WebpackAssetsManifest({
+      entrypoints: true,
+    }),
   ],
 
   output: {
-    filename: 'assets/bi/js/[name].[contenthash].js',
-    publicPath: '/wp-content/plugins/aesirx-analytics/',
+    filename: 'assets/bi/js/[contenthash].js',
     clean: true,
   },
 
@@ -80,11 +82,7 @@ module.exports = {
     minimize: true,
     minimizer: [
       new TerserPlugin({
-        terserOptions: {
-          compress: {
-            drop_console: true,
-          },
-        },
+        terserOptions: { output: { comments: false } },
       }),
     ],
     splitChunks: {
@@ -96,5 +94,6 @@ module.exports = {
       react$: require.resolve(path.resolve(__dirname, './node_modules/react')),
     },
     extensions: ['.tsx', '.ts', '.js'],
+    fallback: { 'process/browser': require.resolve('process/browser') },
   },
 };
